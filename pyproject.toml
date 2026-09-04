@@ -11,7 +11,11 @@ requires-python = ">=3.12"
 dependencies = [
   "platformdirs>=4.3.0",
   "pydantic>=2.10.0",
+  "trafilatura>=2.2,<3",
 ]
+
+[project.optional-dependencies]
+pdf = ["docling>=2.0"]
 
 [project.scripts]
 curiosity = "curiosity.cli:main"

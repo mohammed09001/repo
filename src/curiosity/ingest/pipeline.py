@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -84,6 +85,7 @@ def normalize_text(text: str) -> str:
 
 
 def parse_html(body: bytes) -> str:
+    """Fallback for malformed pages when the primary extractor yields no content."""
     parser = _MainText()
     try:
         parser.feed(body.decode("utf-8", errors="strict"))
@@ -95,17 +97,61 @@ def parse_html(body: bytes) -> str:
     return text
 
 
+def extract_html(body: bytes) -> str:
+    """Use Trafilatura only on the already bounded response body; it never fetches."""
+    try:
+        from trafilatura import extract
+    except ImportError as exc:  # pragma: no cover - declared runtime dependency
+        raise IngestError("Trafilatura is not installed") from exc
+    try:
+        extracted = extract(
+            body.decode("utf-8", errors="strict"),
+            output_format="txt",
+            include_comments=False,
+            include_tables=False,
+            favor_precision=True,
+        )
+    except UnicodeDecodeError as exc:
+        raise IngestError("HTML is not UTF-8 text") from exc
+    text = normalize_text(extracted or "")
+    if len(text) >= 20:
+        return text
+    fallback = parse_html(body)
+    if len(fallback) < 20:
+        raise IngestError("HTML extraction found no usable main content")
+    return fallback
+
+
+def parse_pdf(body: bytes, *, max_pages: int = 50) -> str:
+    """Convert a bounded, engine-fetched PDF through Docling using a local temporary file."""
+    if not body.startswith(b"%PDF"):
+        raise IngestError("PDF signature is invalid")
+    if body.count(b"/Type /Page") > max_pages:
+        raise IngestError("PDF exceeds configured page limit")
+    try:
+        from docling.document_converter import DocumentConverter
+    except ImportError as exc:
+        raise IngestError("Docling requires the optional curiosity-engine[pdf] dependency") from exc
+    with tempfile.NamedTemporaryFile(suffix=".pdf") as pdf:
+        pdf.write(body)
+        pdf.flush()
+        try:
+            result = DocumentConverter().convert(pdf.name)
+            text = normalize_text(result.document.export_to_markdown())
+        except Exception as exc:  # Docling raises several provider-specific exceptions.
+            raise IngestError("Docling conversion failed") from exc
+    if len(text) < 20:
+        raise IngestError("Docling produced no usable text")
+    return text
+
+
 def parse_document(body: bytes, mime_type: str) -> tuple[str, str]:
     if mime_type in {"text/html", "application/xhtml+xml"}:
-        return parse_html(body), "html-fallback-1"
+        return extract_html(body), "trafilatura-2.2-precision-1"
     if mime_type == "text/plain":
         return normalize_text(body.decode("utf-8", errors="strict")), "plain-1"
     if mime_type == "application/pdf":
-        try:
-            import docling  # type: ignore[import-not-found]  # isolated optional boundary
-        except ImportError as exc:
-            raise IngestError("PDF requires optional Docling parser") from exc
-        raise IngestError(f"Docling integration is not enabled for {docling.__name__}")
+        return parse_pdf(body), "docling-markdown-1"
     raise IngestError(f"MIME type is not allowed: {mime_type}")
 
 

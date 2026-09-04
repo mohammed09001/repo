@@ -42,6 +42,25 @@ def test_semantic_scholar_fixture_never_claims_absent_abstract():
     assert record.metadata["abstract_available"] == "false"
 
 
+def test_semantic_scholar_batch_uses_one_post_request():
+    calls = []
+
+    def post(url, headers, body, timeout):
+        calls.append((url, body))
+        return HttpResponse(
+            200,
+            {},
+            b'[{"paperId":"p1","title":"One"},{"paperId":"p2","title":"Two"}]',
+        )
+
+    adapter = SemanticScholarAdapter(HttpClient(post_transport=post, retries=0))
+    assert [record.metadata["paper_id"] for record in adapter.batch_metadata(["p1", "p2"])] == [
+        "p1",
+        "p2",
+    ]
+    assert len(calls) == 1 and calls[0][1] == b'["p1","p2"]'
+
+
 def test_http_budget_rate_timeout_and_malformed_policies():
     client = fixture_client(HttpResponse(429, {"Retry-After": "60"}, b"{}"), budget=1)
     with pytest.raises(DiscoveryError) as limited:

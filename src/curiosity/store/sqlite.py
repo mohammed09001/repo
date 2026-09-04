@@ -14,13 +14,17 @@ from typing import Any
 from curiosity.contracts.models import (
     Chunk,
     CuriosityCard,
+    CuriosityPulse,
     Evidence,
     Exposure,
+    HarnessEvent,
     KnowledgeAtom,
     PlaybackSession,
     Profile,
+    ProvenanceClass,
     SourceDocument,
     SourceRecord,
+    deterministic_id,
 )
 
 from .migrations import MIGRATIONS
@@ -227,17 +231,176 @@ class LocalStore:
             },
         )
 
-    def put_profile(self, profile: Profile) -> bool:
+    def put_pulse(self, pulse: CuriosityPulse, *, verification: dict[str, Any]) -> bool:
         return self._insert(
-            "profiles",
+            "pulses",
             {
-                "id": profile.id,
-                "display_name": profile.display_name,
-                "created_at": _timestamp(profile.created_at),
-                "provenance": profile.provenance,
-                "payload_json": profile.model_dump_json(),
+                "id": pulse.id,
+                "card_id": pulse.card_id,
+                "atom_id": pulse.atom_id,
+                "display_fact": pulse.display_fact,
+                "source_id": pulse.source_id,
+                "document_id": pulse.document_id,
+                "verified_at": _timestamp(pulse.verified_at),
+                "verification_json": json.dumps(verification, sort_keys=True),
+                "payload_json": pulse.model_dump_json(),
             },
         )
+
+    def put_profile(self, profile: Profile) -> bool:
+        values = {
+            "id": profile.id,
+            "display_name": profile.display_name,
+            "created_at": _timestamp(profile.created_at),
+            "provenance": profile.provenance,
+            "payload_json": profile.model_dump_json(),
+        }
+        with self.transaction(immediate=True) as connection:
+            result = connection.execute(
+                """INSERT INTO profiles (id, display_name, created_at, provenance, payload_json)
+                   VALUES (:id, :display_name, :created_at, :provenance, :payload_json)
+                   ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,
+                   payload_json=excluded.payload_json""",
+                values,
+            )
+        return result.rowcount == 1
+
+    def get_profile(self, profile_id: str) -> Profile | None:
+        row = self.connection.execute(
+            "SELECT payload_json FROM profiles WHERE id=?", (profile_id,)
+        ).fetchone()
+        return Profile.model_validate_json(row["payload_json"]) if row else None
+
+    def get_source(self, source_id: str) -> SourceRecord | None:
+        row = self.connection.execute(
+            "SELECT payload_json FROM sources WHERE id=?", (source_id,)
+        ).fetchone()
+        return SourceRecord.model_validate_json(row["payload_json"]) if row else None
+
+    def list_sources(self) -> list[SourceRecord]:
+        rows = self.connection.execute(
+            "SELECT payload_json FROM sources ORDER BY canonical_locator"
+        )
+        return [SourceRecord.model_validate_json(row["payload_json"]) for row in rows]
+
+    def remove_source(self, source_id: str) -> bool:
+        with self.transaction(immediate=True) as connection:
+            result = connection.execute("DELETE FROM sources WHERE id=?", (source_id,))
+        return result.rowcount == 1
+
+    def list_pulses(self) -> list[CuriosityPulse]:
+        rows = self.connection.execute("SELECT payload_json FROM pulses ORDER BY verified_at, id")
+        return [CuriosityPulse.model_validate_json(row["payload_json"]) for row in rows]
+
+    def get_pulse(self, pulse_id: str) -> CuriosityPulse | None:
+        row = self.connection.execute(
+            "SELECT payload_json FROM pulses WHERE id=?", (pulse_id,)
+        ).fetchone()
+        return CuriosityPulse.model_validate_json(row["payload_json"]) if row else None
+
+    def get_pulse_verification(self, pulse_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT verification_json FROM pulses WHERE id=?", (pulse_id,)
+        ).fetchone()
+        return json.loads(row["verification_json"]) if row else None
+
+    def payloads_for_ids(self, table: str, ids: tuple[str, ...]) -> list[dict[str, Any]]:
+        """Read lineage owned by a pulse; table names are deliberately closed."""
+        if table not in {"atoms", "cards", "evidence"} or not ids:
+            return []
+        marks = ", ".join("?" for _ in ids)
+        rows = self.connection.execute(
+            f"SELECT payload_json FROM {table} WHERE id IN ({marks})", ids
+        )
+        return [json.loads(row["payload_json"]) for row in rows]
+
+    def next_session_pulse(self, profile_id: str) -> CuriosityPulse | None:
+        """Advance a durable local queue; no ranking, parsing, or network work occurs here."""
+        with self.transaction(immediate=True) as connection:
+            session = connection.execute(
+                """SELECT id, position FROM sessions WHERE profile_id=? AND status IN ('created', 'active')
+                   ORDER BY started_at DESC LIMIT 1""",
+                (profile_id,),
+            ).fetchone()
+            if session is None:
+                return None
+            row = connection.execute(
+                """SELECT p.payload_json FROM session_cards sc JOIN pulses p ON p.card_id=sc.card_id
+                   WHERE sc.session_id=? AND sc.ordinal >= ? ORDER BY sc.ordinal LIMIT 1""",
+                (session["id"], session["position"]),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "UPDATE sessions SET status='completed' WHERE id=?", (session["id"],)
+                )
+                return None
+            connection.execute(
+                "UPDATE sessions SET position=position+1, status='active' WHERE id=?",
+                (session["id"],),
+            )
+        return CuriosityPulse.model_validate_json(row["payload_json"])
+
+    def current_session_pulse(self, profile_id: str) -> CuriosityPulse | None:
+        """Return the queued item without changing durable state.
+
+        The terminal renderer calls this before writing.  A crash after the write
+        but before acknowledgement may repeat one fact, which is preferable to
+        silently losing an exposure.
+        """
+        session = self.connection.execute(
+            """SELECT id, position FROM sessions WHERE profile_id=? AND status IN ('created', 'active')
+               ORDER BY started_at DESC LIMIT 1""",
+            (profile_id,),
+        ).fetchone()
+        if session is None:
+            return None
+        row = self.connection.execute(
+            """SELECT p.payload_json FROM session_cards sc JOIN pulses p ON p.card_id=sc.card_id
+               WHERE sc.session_id=? AND sc.ordinal=?""",
+            (session["id"], session["position"]),
+        ).fetchone()
+        return CuriosityPulse.model_validate_json(row["payload_json"]) if row else None
+
+    def record_displayed_pulse(self, profile_id: str, pulse: CuriosityPulse, *, at: datetime) -> bool:
+        """Atomically acknowledge one rendered fact and its durable exposure."""
+        with self.transaction(immediate=True) as connection:
+            session = connection.execute(
+                """SELECT id, position FROM sessions WHERE profile_id=? AND status IN ('created', 'active')
+                   ORDER BY started_at DESC LIMIT 1""",
+                (profile_id,),
+            ).fetchone()
+            if session is None:
+                return False
+            expected = connection.execute(
+                "SELECT card_id FROM session_cards WHERE session_id=? AND ordinal=?",
+                (session["id"], session["position"]),
+            ).fetchone()
+            if expected is None or expected["card_id"] != pulse.card_id:
+                return False
+            exposure = Exposure(
+                id=deterministic_id("exposure", session["id"], str(session["position"])),
+                profile_id=profile_id,
+                card_id=pulse.card_id,
+                exposed_at=at,
+                outcome="shown",
+                provenance=ProvenanceClass.DERIVED_DETERMINISTIC,
+            )
+            connection.execute(
+                """INSERT INTO exposures(id, profile_id, card_id, exposed_at, outcome, provenance, payload_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING""",
+                (exposure.id, exposure.profile_id, exposure.card_id, _timestamp(at), exposure.outcome,
+                 exposure.provenance, exposure.model_dump_json()),
+            )
+            position = int(session["position"]) + 1
+            remaining = connection.execute(
+                "SELECT 1 FROM session_cards WHERE session_id=? AND ordinal>=? LIMIT 1",
+                (session["id"], position),
+            ).fetchone()
+            connection.execute(
+                "UPDATE sessions SET position=?, status=? WHERE id=?",
+                (position, "active" if remaining else "completed", session["id"]),
+            )
+        return True
 
     def put_exposure(self, exposure: Exposure) -> bool:
         return self._insert(
@@ -250,6 +413,18 @@ class LocalStore:
                 "outcome": exposure.outcome,
                 "provenance": exposure.provenance,
                 "payload_json": exposure.model_dump_json(),
+            },
+        )
+
+    def put_harness_event(self, event: HarnessEvent) -> bool:
+        return self._insert(
+            "harness_events",
+            {
+                "id": event.id,
+                "adapter": str(event.details.get("adapter", "unknown")),
+                "event_type": event.event_type,
+                "occurred_at": _timestamp(event.occurred_at),
+                "payload_json": event.model_dump_json(),
             },
         )
 
@@ -434,6 +609,7 @@ class LocalStore:
             "evidence",
             "atoms",
             "cards",
+            "pulses",
             "profiles",
             "exposures",
             "sessions",

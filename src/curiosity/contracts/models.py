@@ -160,10 +160,29 @@ class CuriosityCard(CanonicalModel):
     created_at: datetime
 
 
+class CuriosityPulse(CanonicalModel):
+    """A playable projection; its display sentence is not the source of truth."""
+
+    id: OpaqueId
+    card_id: OpaqueId
+    atom_id: OpaqueId
+    display_fact: str = Field(min_length=1, max_length=500)
+    topics: tuple[str, ...] = Field(default_factory=tuple)
+    source_id: OpaqueId
+    document_id: OpaqueId
+    evidence_ids: tuple[OpaqueId, ...] = Field(min_length=1)
+    verified_at: datetime
+    provenance: Literal[ProvenanceClass.DERIVED_DETERMINISTIC]
+
+
 class Profile(CanonicalModel):
     id: OpaqueId
     display_name: str = Field(min_length=1, max_length=200)
     interests: tuple[str, ...] = Field(default_factory=tuple)
+    topic_weights: dict[str, float] = Field(default_factory=lambda: {"general": 1.0})
+    excluded_topics: tuple[str, ...] = Field(default_factory=tuple)
+    unexpected_discovery_weight: float = Field(default=0.1, ge=0.0, le=1.0)
+    max_consecutive_topic: int = Field(default=2, ge=1, le=20)
     created_at: datetime
     provenance: Literal[ProvenanceClass.USER_AUTHORED]
 

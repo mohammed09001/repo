@@ -41,6 +41,12 @@ class Transport(Protocol):
     def __call__(self, url: str, headers: Mapping[str, str], timeout: float) -> HttpResponse: ...
 
 
+class PostTransport(Protocol):
+    def __call__(
+        self, url: str, headers: Mapping[str, str], body: bytes, timeout: float
+    ) -> HttpResponse: ...
+
+
 @dataclass
 class DiscoveryBudget:
     max_requests: int = 20
@@ -89,6 +95,19 @@ def urllib_transport(url: str, headers: Mapping[str, str], timeout: float) -> Ht
         raise DiscoveryError(f"network error: {error.reason}", transient=True) from error
 
 
+def urllib_post_transport(
+    url: str, headers: Mapping[str, str], body: bytes, timeout: float
+) -> HttpResponse:
+    request = Request(url, data=body, headers=dict(headers), method="POST")
+    try:
+        with build_opener(_BoundedRedirects(3)).open(request, timeout=timeout) as response:  # noqa: S310
+            return HttpResponse(response.status, dict(response.headers.items()), response.read())
+    except HTTPError as error:
+        return HttpResponse(error.code, dict(error.headers.items()), error.read())
+    except URLError as error:
+        raise DiscoveryError(f"network error: {error.reason}", transient=True) from error
+
+
 class HttpClient:
     """One request policy: user agent, bounds, retries, rate errors, and cancellation."""
 
@@ -96,6 +115,7 @@ class HttpClient:
         self,
         *,
         transport: Transport = urllib_transport,
+        post_transport: PostTransport = urllib_post_transport,
         budget: DiscoveryBudget | None = None,
         timeout_seconds: float = 10.0,
         max_response_bytes: int = 1_000_000,
@@ -103,7 +123,11 @@ class HttpClient:
         retry_backoff_seconds: float = 0.25,
         sleeper: Callable[[float], None] = time.sleep,
     ):
-        self.transport, self.budget = transport, budget or DiscoveryBudget()
+        self.transport, self.post_transport, self.budget = (
+            transport,
+            post_transport,
+            budget or DiscoveryBudget(),
+        )
         self.timeout_seconds, self.max_response_bytes, self.retries, self.sleeper = (
             timeout_seconds,
             max_response_bytes,
@@ -157,3 +181,35 @@ class HttpClient:
                 raise error
             self.sleeper(self.retry_backoff_seconds * (2**attempt))
         raise AssertionError("unreachable")
+
+    def post_json(
+        self,
+        url: str,
+        payload: dict[str, object] | list[str],
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> tuple[dict | list, Mapping[str, str]]:
+        request_headers = {
+            "User-Agent": "curiosity-engine/0.1 metadata-discovery",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        request_headers.update(headers or {})
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.budget.consume()
+        response = self.post_transport(url, request_headers, body, self.timeout_seconds)
+        if len(response.body) > self.max_response_bytes:
+            raise DiscoveryError("response exceeds configured size bound", transient=False)
+        if response.status == 429 or (response.status == 403 and _retry_after(response.headers)):
+            raise DiscoveryError(
+                "rate limited", transient=True, retry_after=_retry_after(response.headers)
+            )
+        if response.status >= 400:
+            raise DiscoveryError(f"permanent HTTP error ({response.status})", transient=False)
+        try:
+            decoded = json.loads(response.body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DiscoveryError("malformed JSON response", transient=False) from exc
+        if not isinstance(decoded, (dict, list)):
+            raise DiscoveryError("JSON response must be an object or array", transient=False)
+        return decoded, response.headers

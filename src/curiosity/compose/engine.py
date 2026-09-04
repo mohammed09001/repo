@@ -34,22 +34,29 @@ def compose_card(
 ) -> CardPacket:
     if verification.status is not VerificationStatus.VERIFIED or not verification.playable:
         raise CompositionError("only verified, policy-safe candidates may be composed")
-    claim = candidate.atom.statement.strip().rstrip(".")
-    hook = f"Why does this matter: {claim}?"
-    body = candidate.atom.statement
-    if len(hook) > 180 or len(body) > 500 or _CLICKBAIT.search(hook):
-        raise CompositionError("card violates bounded anti-clickbait grammar")
+    body = candidate.atom.statement.strip()
+    if not body.endswith("."):
+        body += "."
+    words = body.rstrip(".").split()
+    if (
+        len(body) > 240
+        or len(words) < 3
+        or len(words) > 40
+        or body.count(".") != 1
+        or _CLICKBAIT.search(body)
+    ):
+        raise CompositionError("fact violates concise educational-fact grammar")
     evidence_ids = tuple(evidence.id for evidence in candidate.evidence)
     card = CuriosityCard(
         id=deterministic_id("card", candidate.atom.id, card_type, "deterministic-v1"),
         card_type=card_type,
-        prompt=f"{hook}\n{body}",
+        prompt=body,
         atom_ids=(candidate.atom.id,),
         evidence_ids=evidence_ids,
         provenance=ProvenanceClass.DERIVED_DETERMINISTIC,
         created_at=datetime.now(UTC),
     )
-    return CardPacket(card, hook, body, card.atom_ids, evidence_ids)
+    return CardPacket(card, body, body, card.atom_ids, evidence_ids)
 
 
 def compose_sequence(

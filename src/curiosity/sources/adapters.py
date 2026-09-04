@@ -116,13 +116,17 @@ class GitHubAdapter:
 class SemanticScholarAdapter:
     base_url = "https://api.semanticscholar.org/graph/v1"
 
-    def __init__(self, client: HttpClient):
-        self.client = client
+    def __init__(self, client: HttpClient, api_key: str | None = None):
+        self.client, self.api_key = client, api_key
+
+    def _headers(self) -> dict[str, str]:
+        return {"x-api-key": self.api_key} if self.api_key else {}
 
     def search(self, query: str, *, limit: int = 10) -> list[SourceRecord]:
         fields = "paperId,title,abstract,url,year,venue"
         payload, _ = self.client.get_json(
-            f"{self.base_url}/paper/search?query={query}&limit={min(limit, 100)}&fields={fields}"
+            f"{self.base_url}/paper/search?query={query}&limit={min(limit, 100)}&fields={fields}",
+            headers=self._headers(),
         )
         if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
             raise DiscoveryError("Semantic Scholar search payload lacks data", transient=False)
@@ -131,7 +135,8 @@ class SemanticScholarAdapter:
     def metadata(self, locator: str) -> SourceRecord:
         paper_id = locator.rsplit("/", 1)[-1]
         payload, _ = self.client.get_json(
-            f"{self.base_url}/paper/{paper_id}?fields=paperId,title,abstract,url,year,venue"
+            f"{self.base_url}/paper/{paper_id}?fields=paperId,title,abstract,url,year,venue",
+            headers=self._headers(),
         )
         if not isinstance(payload, dict):
             raise DiscoveryError("Semantic Scholar paper payload is not an object", transient=False)
@@ -159,8 +164,37 @@ class SemanticScholarAdapter:
     def batch_metadata(self, paper_ids: list[str]) -> list[SourceRecord]:
         if not paper_ids or len(paper_ids) > 100:
             raise ValueError("batch must contain 1..100 paper IDs")
-        # The official batch endpoint is POST; callers can inject a matching transport when enabled.
-        return [self.metadata(paper_id) for paper_id in paper_ids]
+        fields = "paperId,title,abstract,url,year,venue"
+        payload, _ = self.client.post_json(
+            f"{self.base_url}/paper/batch?fields={fields}", paper_ids, headers=self._headers()
+        )
+        if not isinstance(payload, list):
+            raise DiscoveryError("Semantic Scholar batch payload is not a list", transient=False)
+        return [
+            self._paper(item) for item in payload if isinstance(item, dict) and item.get("paperId")
+        ]
+
+    def recommendations(
+        self,
+        positive_paper_ids: list[str],
+        *,
+        negative_paper_ids: list[str] | None = None,
+        limit: int = 10,
+    ) -> list[SourceRecord]:
+        if not positive_paper_ids:
+            raise ValueError("at least one positive seed is required")
+        payload, _ = self.client.post_json(
+            "https://api.semanticscholar.org/recommendations/v1/papers/",
+            {"positivePaperIds": positive_paper_ids, "negativePaperIds": negative_paper_ids or []},
+            headers=self._headers(),
+        )
+        if not isinstance(payload, dict) or not isinstance(payload.get("recommendedPapers"), list):
+            raise DiscoveryError("recommendations payload lacks recommendedPapers", transient=False)
+        return [
+            self._paper(item)
+            for item in payload["recommendedPapers"][:limit]
+            if isinstance(item, dict)
+        ]
 
 
 class WebAdapter:

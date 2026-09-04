@@ -197,6 +197,51 @@ MIGRATIONS = (
             """,
         ),
     ),
+    Migration(
+        3,
+        "playable_pulses",
+        (
+            """
+            CREATE TABLE pulses (
+                id TEXT PRIMARY KEY,
+                card_id TEXT NOT NULL UNIQUE REFERENCES cards(id) ON DELETE RESTRICT,
+                atom_id TEXT NOT NULL REFERENCES atoms(id) ON DELETE RESTRICT,
+                display_fact TEXT NOT NULL,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE RESTRICT,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE RESTRICT,
+                verified_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX pulses_source_idx ON pulses(source_id, document_id)",
+        ),
+    ),
+    Migration(
+        4,
+        "session_queue_position",
+        ("ALTER TABLE sessions ADD COLUMN position INTEGER NOT NULL DEFAULT 0",),
+    ),
+    Migration(
+        5,
+        "harness_events",
+        (
+            """
+            CREATE TABLE harness_events (
+                id TEXT PRIMARY KEY,
+                adapter TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX harness_events_adapter_time_idx ON harness_events(adapter, occurred_at)",
+        ),
+    ),
+    Migration(
+        6,
+        "pulse_verification",
+        ("ALTER TABLE pulses ADD COLUMN verification_json TEXT NOT NULL DEFAULT '{}'",),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version

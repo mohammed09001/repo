@@ -54,6 +54,8 @@ def test_verified_card_is_bounded_and_traceable():
     card = compose_card(item, result)
     assert card.atom_ids == (item.atom.id,) and card.evidence_ids == item.atom.evidence_ids
     assert len(card.hook) <= 180 and len(card.body) <= 500
+    assert card.card.prompt == card.body
+    assert "why does this matter" not in card.card.prompt.casefold()
 
 
 def test_unverified_and_unrelated_sequence_restrictions():
