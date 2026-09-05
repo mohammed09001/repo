@@ -3,3 +3,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 doctor-data/
+
+# Local runtime stores and scratch paths. Fixture databases under tests/ remain tracked.
+.cli-verification/
+*.db-wal
+*.db-shm

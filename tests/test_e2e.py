@@ -40,7 +40,7 @@ def test_offline_personal_terminal_e2e(tmp_path):
         app.initialize(display_name="Ada")
         app.configure_profile(weights={"general": 3.0})
         app.add_source("https://example.test/knowledge", title="Fixture title")
-        assert app.refresh_build() == 1
+        assert app.refresh_build().pulses_built == 1
         assert fixture.calls == 1
         queued = app.prepare_playback(size=3)
         assert len(queued) == 1

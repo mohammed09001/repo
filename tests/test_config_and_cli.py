@@ -54,6 +54,44 @@ def test_doctor_reports_no_secret_and_starts_without_provider(tmp_path: Path, ca
     assert "API_KEY" not in output
 
 
+def test_discovery_credentials_come_from_config_owned_sources(tmp_path):
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        'github_token = "file-token"\nsemantic_scholar_api_key = "file-s2"\nyoutube_api_key = "file-yt"\n'
+    )
+    env = {"CURIOSITY_GITHUB_TOKEN": "env-token", "CURIOSITY_S2_API_KEY": "env-s2"}
+    config = load_config(
+        config_path=config_file,
+        env=env,
+        cli={"data_path": tmp_path / "data"},
+    )
+    assert config.github_token == "env-token"
+    assert config.semantic_scholar_api_key == "env-s2"
+    assert config.youtube_api_key == "file-yt"
+    assert repr(config) == repr(config)  # secrets stay out of repr
+
+
+def test_doctor_reports_discovery_capabilities_without_secrets(tmp_path: Path, capsys):
+    assert (
+        main(
+            [
+                "doctor",
+                "--config",
+                str(tmp_path / "config.toml"),
+                "--data-path",
+                str(tmp_path / "data"),
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "capability.discovery_github" in output
+    assert "capability.discovery_papers" in output
+    assert "capability.discovery_youtube" in output
+    assert "API_KEY" not in output
+    assert "token" not in output
+
+
 def test_doctor_cli_flags_override_file_features(tmp_path: Path, capsys):
     config_file = tmp_path / "config.toml"
     config_file.write_text("[features]\nyoutube = false\n")

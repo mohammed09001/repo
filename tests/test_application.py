@@ -24,8 +24,8 @@ def test_offline_refresh_is_idempotent_and_pulses_survive_reopen(tmp_path):
         app = CuriosityApplication(store, fetcher=FixtureFetcher(), now=now)
         profile = app.initialize()
         source = app.add_source("https://example.test/fact")
-        assert app.refresh_build() == 1
-        assert app.refresh_build() == 0
+        assert app.refresh_build().pulses_built == 1
+        assert app.refresh_build().pulses_built == 0
         pulses = app.prepare_playback()
         assert [pulse.display_fact for pulse in pulses] == [
             "A deterministic fixture demonstrates durable local orchestration."
@@ -36,11 +36,12 @@ def test_offline_refresh_is_idempotent_and_pulses_survive_reopen(tmp_path):
         assert current is not None and current.id == pulses[0].id
         assert app.acknowledge_playback_pulse(current)
         assert app.stats()["facts_shown"] == 1
-        restarted = app.prepare_playback()
-        assert restarted
-        assert app.current_playback_pulse() is not None
-        assert app.inspect_pulse(restarted[0].id)["verification"]["status"] == "verified"
+        # The single fact was just shown, so exposure cooldown excludes it.
+        assert app.prepare_playback() == ()
+        assert app.current_playback_pulse() is None
+        # The pulse is still durable and inspectable after the exposure.
+        assert app.inspect_pulse(pulses[0].id)["verification"]["status"] == "verified"
         assert store.get_profile(profile.id) == profile
     with LocalStore(path) as reopened:
         assert len(reopened.list_pulses()) == 1
-        assert CuriosityApplication(reopened, now=now).current_playback_pulse() is not None
+        assert CuriosityApplication(reopened, now=now).current_playback_pulse() is None

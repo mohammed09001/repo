@@ -49,11 +49,12 @@ def test_200_then_304_reuses_document_and_chunks(tmp_path: Path):
     )
     with LocalStore(tmp_path / "store.db") as store:
         pipeline = IngestionPipeline(store, fetcher)
-        document, chunks, reused = pipeline.ingest(source())
-        again, again_chunks, reused_again = pipeline.ingest(source())
-        assert not reused and reused_again and again.id == document.id and again_chunks == chunks
+        outcome = pipeline.ingest(source())
+        again = pipeline.ingest(source())
+        assert not outcome.reused and again.reused
+        assert again.document.id == outcome.document.id and again.chunks == outcome.chunks
         assert fetcher.headers[1]["If-None-Match"] == "tag"
-        assert "noise" not in document.raw_text and "bad" not in document.raw_text
+        assert "noise" not in outcome.document.raw_text and "bad" not in outcome.document.raw_text
 
 
 def test_bounded_failures_and_deterministic_chunks(tmp_path: Path):
@@ -67,14 +68,24 @@ def test_bounded_failures_and_deterministic_chunks(tmp_path: Path):
         html = b"<p>One sentence. Two sentence. Three sentence.</p>"
         first = IngestionPipeline(
             store, FakeFetcher(FetchResponse(200, html, "text/html")), chunk_ceiling=100
-        ).ingest(source())[1]
+        ).ingest(source()).chunks
         second = IngestionPipeline(
             store, FakeFetcher(FetchResponse(200, html, "text/html")), chunk_ceiling=100
-        ).ingest(source())[1]
+        ).ingest(source()).chunks
         assert [chunk.id for chunk in first] == [chunk.id for chunk in second]
 
 
-def test_pdf_isolated_and_does_not_mutate_existing_document(tmp_path: Path):
+def test_pdf_isolated_and_does_not_mutate_existing_document(tmp_path, monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def missing_docling(name, *args, **kwargs):
+        if name == "docling" or name.startswith("docling."):
+            raise ImportError("no docling")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_docling)
     with LocalStore(tmp_path / "store.db") as store:
         pipeline = IngestionPipeline(
             store, FakeFetcher(FetchResponse(200, b"%PDF", "application/pdf"))

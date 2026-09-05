@@ -1,4 +1,8 @@
-"""Shared bounded HTTP behavior; adapters receive transport rather than owning clients."""
+"""Shared bounded HTTP behavior; adapters receive transport rather than owning clients.
+
+One long-lived pooled HTTPX client is used per discovery/refresh run. Tests
+inject scripted transports so the suite never touches the network.
+"""
 
 from __future__ import annotations
 
@@ -9,8 +13,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Protocol
-from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+import httpx
+
+_REDIRECT_LIMIT = 10
+_POOL_CONNECTIONS = 5
 
 
 class DiscoveryError(RuntimeError):
@@ -71,41 +78,56 @@ def _retry_after(headers: Mapping[str, str]) -> datetime | None:
             return None
 
 
-class _BoundedRedirects(HTTPRedirectHandler):
-    def __init__(self, maximum: int) -> None:
-        super().__init__()
-        self.maximum, self.seen = maximum, 0
-
-    def redirect_request(self, *args: object, **kwargs: object) -> Request | None:
-        self.seen += 1
-        if self.seen > self.maximum:
-            return None
-        return super().redirect_request(*args, **kwargs)
-
-
-def urllib_transport(url: str, headers: Mapping[str, str], timeout: float) -> HttpResponse:
-    request = Request(url, headers=dict(headers))
-    try:
-        opener = build_opener(_BoundedRedirects(3))
-        with opener.open(request, timeout=timeout) as response:  # noqa: S310 - explicit adapter endpoints only
-            return HttpResponse(response.status, dict(response.headers.items()), response.read())
-    except HTTPError as error:
-        return HttpResponse(error.code, dict(error.headers.items()), error.read())
-    except URLError as error:
-        raise DiscoveryError(f"network error: {error.reason}", transient=True) from error
+def _bounded_body(response: httpx.Response, *, max_bytes: int) -> bytes:
+    total = 0
+    parts: list[bytes] = []
+    for chunk in response.iter_bytes():
+        total += len(chunk)
+        if total > max_bytes:
+            raise DiscoveryError("response exceeds configured size bound", transient=False)
+        parts.append(chunk)
+    return b"".join(parts)
 
 
-def urllib_post_transport(
-    url: str, headers: Mapping[str, str], body: bytes, timeout: float
-) -> HttpResponse:
-    request = Request(url, data=body, headers=dict(headers), method="POST")
-    try:
-        with build_opener(_BoundedRedirects(3)).open(request, timeout=timeout) as response:  # noqa: S310
-            return HttpResponse(response.status, dict(response.headers.items()), response.read())
-    except HTTPError as error:
-        return HttpResponse(error.code, dict(error.headers.items()), error.read())
-    except URLError as error:
-        raise DiscoveryError(f"network error: {error.reason}", transient=True) from error
+def httpx_transport(
+    client: httpx.Client, *, max_response_bytes: int
+) -> Transport:
+    def transport(url: str, headers: Mapping[str, str], timeout: float) -> HttpResponse:
+        response = client.get(
+            url,
+            headers=dict(headers),
+            timeout=timeout,
+            follow_redirects=True,
+        )
+        return HttpResponse(
+            response.status_code,
+            dict(response.headers.items()),
+            _bounded_body(response, max_bytes=max_response_bytes),
+        )
+
+    return transport
+
+
+def httpx_post_transport(
+    client: httpx.Client, *, max_response_bytes: int
+) -> PostTransport:
+    def transport(
+        url: str, headers: Mapping[str, str], body: bytes, timeout: float
+    ) -> HttpResponse:
+        response = client.post(
+            url,
+            headers=dict(headers),
+            content=body,
+            timeout=timeout,
+            follow_redirects=True,
+        )
+        return HttpResponse(
+            response.status_code,
+            dict(response.headers.items()),
+            _bounded_body(response, max_bytes=max_response_bytes),
+        )
+
+    return transport
 
 
 class HttpClient:
@@ -114,8 +136,8 @@ class HttpClient:
     def __init__(
         self,
         *,
-        transport: Transport = urllib_transport,
-        post_transport: PostTransport = urllib_post_transport,
+        transport: Transport | None = None,
+        post_transport: PostTransport | None = None,
         budget: DiscoveryBudget | None = None,
         timeout_seconds: float = 10.0,
         max_response_bytes: int = 1_000_000,
@@ -123,11 +145,9 @@ class HttpClient:
         retry_backoff_seconds: float = 0.25,
         sleeper: Callable[[float], None] = time.sleep,
     ):
-        self.transport, self.post_transport, self.budget = (
-            transport,
-            post_transport,
-            budget or DiscoveryBudget(),
-        )
+        self.transport = transport
+        self.post_transport = post_transport
+        self.budget = budget or DiscoveryBudget()
         self.timeout_seconds, self.max_response_bytes, self.retries, self.sleeper = (
             timeout_seconds,
             max_response_bytes,
@@ -135,6 +155,85 @@ class HttpClient:
             sleeper,
         )
         self.retry_backoff_seconds = retry_backoff_seconds
+        self._client: httpx.Client | None = None
+        self.bytes_received = 0
+        self.retries_performed = 0
+
+    def _note(self, response: HttpResponse) -> None:
+        self.bytes_received += len(response.body)
+
+    def _resolve_transport(self) -> None:
+        if self.transport is None:
+            self._client = httpx.Client(
+                timeout=httpx.Timeout(
+                    self.timeout_seconds,
+                    connect=self.timeout_seconds,
+                    read=self.timeout_seconds,
+                    write=self.timeout_seconds,
+                    pool=self.timeout_seconds,
+                ),
+                limits=httpx.Limits(
+                    max_connections=_POOL_CONNECTIONS,
+                    max_keepalive_connections=_POOL_CONNECTIONS,
+                ),
+                max_redirects=_REDIRECT_LIMIT,
+            )
+            self.transport = httpx_transport(self._client, max_response_bytes=self.max_response_bytes)
+        if self.post_transport is None:
+            client = self._client or httpx.Client()
+            if self._client is None:
+                self._client = client
+            self.post_transport = httpx_post_transport(
+                client, max_response_bytes=self.max_response_bytes
+            )
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    def get_bytes(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+        accept: str = "application/xml,text/xml,text/plain",
+    ) -> tuple[bytes, Mapping[str, str]]:
+        """Bounded raw GET for non-JSON resources such as RSS/Atom feeds."""
+        self._resolve_transport()
+        request_headers = {
+            "User-Agent": "curiosity-engine/1.0 metadata-discovery",
+            "Accept": accept,
+        }
+        request_headers.update(headers or {})
+        for attempt in range(self.retries + 1):
+            if cancelled and cancelled():
+                raise Cancelled()
+            self.budget.consume()
+            response = self.transport(url, request_headers, self.timeout_seconds)
+            self._note(response)
+            if len(response.body) > self.max_response_bytes:
+                raise DiscoveryError("response exceeds configured size bound", transient=False)
+            if response.status == 429 or (
+                response.status == 403 and _retry_after(response.headers)
+            ):
+                raise DiscoveryError(
+                    "rate limited",
+                    transient=True,
+                    retry_after=_retry_after(response.headers),
+                )
+            if 500 <= response.status <= 599:
+                error = DiscoveryError(f"server error ({response.status})", transient=True)
+            elif response.status >= 400:
+                raise DiscoveryError(f"permanent HTTP error ({response.status})", transient=False)
+            else:
+                return response.body, response.headers
+            self.retries_performed += 1
+            if attempt == self.retries:
+                raise error
+            self.sleeper(self.retry_backoff_seconds * (2**attempt))
+        raise AssertionError("unreachable")
 
     def get_json(
         self,
@@ -143,8 +242,9 @@ class HttpClient:
         headers: Mapping[str, str] | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> tuple[dict | list, Mapping[str, str]]:
+        self._resolve_transport()
         request_headers = {
-            "User-Agent": "curiosity-engine/0.1 metadata-discovery",
+            "User-Agent": "curiosity-engine/1.0 metadata-discovery",
             "Accept": "application/json",
         }
         request_headers.update(headers or {})
@@ -153,17 +253,20 @@ class HttpClient:
                 raise Cancelled()
             self.budget.consume()
             response = self.transport(url, request_headers, self.timeout_seconds)
+            self._note(response)
             if len(response.body) > self.max_response_bytes:
                 raise DiscoveryError("response exceeds configured size bound", transient=False)
             if response.status == 429 or (
                 response.status == 403 and _retry_after(response.headers)
             ):
-                error = DiscoveryError(
+                # Rate limits must not be retried aggressively; honor Retry-After
+                # durably and let the caller exit boundedly.
+                raise DiscoveryError(
                     f"rate limited ({response.status})",
                     transient=True,
                     retry_after=_retry_after(response.headers),
                 )
-            elif 500 <= response.status <= 599:
+            if 500 <= response.status <= 599:
                 error = DiscoveryError(f"server error ({response.status})", transient=True)
             elif response.status >= 400:
                 raise DiscoveryError(f"permanent HTTP error ({response.status})", transient=False)
@@ -177,6 +280,7 @@ class HttpClient:
                         "JSON response must be an object or array", transient=False
                     )
                 return payload, response.headers
+            self.retries_performed += 1
             if attempt == self.retries:
                 raise error
             self.sleeper(self.retry_backoff_seconds * (2**attempt))
@@ -189,8 +293,9 @@ class HttpClient:
         *,
         headers: Mapping[str, str] | None = None,
     ) -> tuple[dict | list, Mapping[str, str]]:
+        self._resolve_transport()
         request_headers = {
-            "User-Agent": "curiosity-engine/0.1 metadata-discovery",
+            "User-Agent": "curiosity-engine/1.0 metadata-discovery",
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
@@ -198,6 +303,7 @@ class HttpClient:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.budget.consume()
         response = self.post_transport(url, request_headers, body, self.timeout_seconds)
+        self._note(response)
         if len(response.body) > self.max_response_bytes:
             raise DiscoveryError("response exceeds configured size bound", transient=False)
         if response.status == 429 or (response.status == 403 and _retry_after(response.headers)):

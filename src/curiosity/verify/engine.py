@@ -46,7 +46,9 @@ _HIGH_RISK = re.compile(
     r"\b(medical|diagnos|treat|legal|lawsuit|invest|financial|investment)\b", re.I
 )
 _SUPERLATIVE = re.compile(r"\b(always|never|best|worst|proves)\b", re.I)
-_NUMBER = re.compile(r"\b\d+(?:\.\d+)?(?:%|\b)")
+# No word-boundary requirement: a digit adjacent to a non-Latin script character
+# (e.g. CJK "有2顆") must still count as a numeric anchor.
+_NUMBER = re.compile(r"\d+(?:\.\d+)?(?:%|\b)?")
 
 
 def _risks(statement: str) -> tuple[str, ...]:

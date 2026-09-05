@@ -54,6 +54,10 @@ def opencode_event(payload: dict[str, Any]) -> HarnessEvent | None:
         return normalize("opencode", "session_start")
     if kind == "session.idle":
         return normalize("opencode", "idle")
+    if kind == "session.error":
+        # A session error is a terminal/quiet transition; it is never guessed
+        # as busy or as successful completion.
+        return normalize("opencode", "session_end")
     if kind == "session.status":
         status = payload.get("properties", {}).get("status")
         if status in {"busy", "idle"}:
@@ -61,9 +65,22 @@ def opencode_event(payload: dict[str, Any]) -> HarnessEvent | None:
     return None
 
 
+def codex_event(payload: dict[str, Any]) -> HarnessEvent | None:
+    """Map the current Codex 'notify' completion payload only.
+
+    Codex spawns the configured command after each completed turn with a JSON
+    payload whose type is ``agent-turn-complete``; it exposes no busy/idle
+    signal, so only the completion is mapped. Any prompt/input fields in the
+    payload are never read.
+    """
+    if payload.get("type") != "agent-turn-complete":
+        return None
+    return normalize("codex_notify", "turn_complete")
+
+
 def codex_notification() -> HarnessEvent:
     """Codex completion notification has no implied busy/idle state."""
-    event = normalize("codex_notify", "turn_complete")
+    event = codex_event({"type": "agent-turn-complete"})
     assert event is not None
     return event
 
@@ -110,30 +127,79 @@ def uninstall_claude(settings_path: Path, *, command: str = "curiosity harness e
     return True
 
 
+def claude_status(
+    settings_path: Path, *, command: str = "curiosity harness emit claude turn_complete"
+) -> dict[str, bool]:
+    """Compatibility diagnostics read from the settings file; never scraped."""
+    settings = _read_json(settings_path)
+    owned = {"matcher": "", "hooks": [{"type": "command", "command": command}]}
+    stop = settings.get("hooks", {}).get("Stop", [])
+    return {
+        "disable_all_hooks": settings.get("disableAllHooks") is True,
+        "owned_stop_hook": owned in stop if isinstance(stop, list) else False,
+        "other_stop_hooks": (
+            any(hook != owned for hook in stop) if isinstance(stop, list) else False
+        ),
+        "status_line_present": "statusLine" in settings,
+        # Explicit rejection: driving orchestration from the status line would
+        # spawn a Curiosity process at status-line frequency and replace the
+        # user's own statusLine; completion hooks already cover the lifecycle.
+        "status_line_unused": True,
+    }
+
+
 def opencode_plugin(command: str = "curiosity harness emit opencode") -> str:
-    """Native plugin using only documented session lifecycle event names."""
+    """Native plugin using only documented session lifecycle event names.
+
+    ``session.status`` busy/idle, ``session.idle``, ``session.created``, and
+    ``session.error`` are all currently documented OpenCode session events.
+    A per-kind 1s debounce absorbs event storms before any process is spawned.
+    """
     quoted = json.dumps(command)
-    return f'''export const Curiosity = async () => ({{
-  event: async ({{ event }}) => {{
-    if (!["session.created", "session.idle", "session.status"].includes(event.type)) return
-    const status = event.properties?.status
-    if (event.type === "session.status" && !["busy", "idle"].includes(status)) return
-    const kind = event.type === "session.created" ? "session_start" : event.type === "session.idle" ? "idle" : status === "busy" ? "working" : "idle"
-    Bun.spawn({{ cmd: ["sh", "-lc", {quoted} + " " + kind] }})
-  }},
-}})
-'''
+    return (
+        "// Managed by Curiosity Engine. Marker: curiosity-harness-plugin.\n"
+        "// Remove with: curiosity harness uninstall opencode --path <this file>\n"
+        f"export const Curiosity = async () => {{\n"
+        f"  let lastKind = null\n"
+        f"  let lastAt = 0\n"
+        f"  return {{\n"
+        f"    event: async ({{ event }}) => {{\n"
+        f'      if (!["session.created", "session.idle", "session.status", "session.error"].includes(event.type)) return\n'
+        f"      const status = event.properties?.status\n"
+        f'      if (event.type === "session.status" && !["busy", "idle"].includes(status)) return\n'
+        f"      const kind =\n"
+        f'        event.type === "session.created" ? "session_start"\n'
+        f'        : event.type === "session.error" ? "session_end"\n'
+        f'        : event.type === "session.idle" ? "idle"\n'
+        f'        : status === "busy" ? "working"\n'
+        f'        : "idle"\n'
+        f"      const now = Date.now()\n"
+        f"      if (kind === lastKind && now - lastAt < 1000) return\n"
+        f"      lastKind = kind\n"
+        f"      lastAt = now\n"
+        f"      Bun.spawn({{ cmd: [\"sh\", \"-lc\", {quoted} + \" \" + kind] }})\n"
+        f"    }},\n"
+        f"  }}\n"
+        f"}}\n"
+    )
+
+
+_OPCODE_OWNERSHIP_MARKER = "curiosity-harness-plugin"
 
 
 def install_opencode(plugin_path: Path, *, command: str = "curiosity harness emit opencode") -> None:
     if plugin_path.exists():
-        raise ValueError(f"refusing to overwrite existing plugin: {plugin_path}")
+        existing = plugin_path.read_text(encoding="utf-8")
+        if _OPCODE_OWNERSHIP_MARKER not in existing:
+            raise ValueError(f"refusing to overwrite existing plugin: {plugin_path}")
     plugin_path.parent.mkdir(parents=True, exist_ok=True)
     plugin_path.write_text(opencode_plugin(command), encoding="utf-8")
 
 
 def uninstall_opencode(plugin_path: Path) -> bool:
-    if not plugin_path.exists() or "export const Curiosity" not in plugin_path.read_text(encoding="utf-8"):
+    if not plugin_path.exists() or _OPCODE_OWNERSHIP_MARKER not in plugin_path.read_text(
+        encoding="utf-8"
+    ):
         return False
     plugin_path.unlink()
     return True

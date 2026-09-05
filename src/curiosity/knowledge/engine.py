@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import Protocol
 
+from curiosity.contracts import stages
 from curiosity.contracts.models import (
     Chunk,
     ClaimStatus,
@@ -39,41 +38,38 @@ class KnowledgeCandidate:
         return self.status == "verified" and bool(self.evidence)
 
 
-class StructuredProvider(Protocol):
-    model_id: str
-
-    def generate_structured(self, prompt: str) -> tuple[str, int, int, float]: ...
-
-
-@dataclass
-class ExtractionBudget:
-    max_calls: int = 10
-    max_input_chars: int = 20_000
-    used_calls: int = 0
-
-    def consume(self, text: str) -> None:
-        if self.used_calls >= self.max_calls or len(text) > self.max_input_chars:
-            raise KnowledgeError("structured extraction budget exhausted")
-        self.used_calls += 1
-
-
 _BOILERPLATE = re.compile(
     r"\b(cookie|privacy policy|subscribe|all rights reserved|buy now)\b", re.I
 )
+
+_NON_LATIN = re.compile(
+    r"[\u0370-\u03FF\u0400-\u04FF\u0590-\u05FF\u0600-\u06FF\u0900-\u097F"
+    r"\u0E00-\u0E7F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF]"
+)
+_ACCENTED = re.compile(
+    r"[àâäçéèêëïîôöùûüÿñæœßáíóúýÀÂÄÇÉÈÊËÏÎÔÖÙÛÜÑÁÍÓÚÝ]"
+)
+
+
+def is_english(text: str) -> bool:
+    """Deterministic heuristic: non-Latin scripts are never English, and any
+    accented Latin character signals a Latin-script foreign language."""
+    if _NON_LATIN.search(text):
+        return False
+    return not _ACCENTED.search(text)
 
 
 def normalize_claim(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().casefold()
 
 
-def topic_slug(text: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", text.casefold()).strip("-")
-    if not slug:
-        raise ValueError("topic must contain letters or numbers")
-    return slug
+def fact_fingerprint(text: str) -> str:
+    """Exact normalized fingerprint of a displayed fact. This is Stage 1 of the
+    Near-Duplicate Firewall and the cooldown key; it never includes metadata."""
+    return sha256(normalize_claim(text).encode("utf-8")).hexdigest()
 
 
-def _candidate(
+def make_candidate(
     document: SourceDocument,
     chunk: Chunk,
     statement: str,
@@ -81,8 +77,12 @@ def _candidate(
     provenance: ProvenanceClass,
     topics: tuple[str, ...] = (),
     why: str = "source-grounded candidate",
+    extractor_version: str | None = None,
 ) -> KnowledgeCandidate:
+    """Build a candidate whose atom binds to one evidence chunk. The statement
+    is the claim being judged; the evidence quote is always the raw chunk text."""
     normalized = normalize_claim(statement)
+    contract = extractor_version or stages.EXTRACTOR_VERSION
     evidence_id = deterministic_id(
         "evidence",
         document.source_id,
@@ -100,7 +100,7 @@ def _candidate(
         provenance=ProvenanceClass.DERIVED_DETERMINISTIC,
     )
     atom = KnowledgeAtom(
-        id=deterministic_id("atom", chunk.id, sha256(normalized.encode()).hexdigest()),
+        id=deterministic_id("atom", chunk.id, contract, sha256(normalized.encode()).hexdigest()),
         statement=statement,
         claim_status=ClaimStatus.CANDIDATE,
         evidence_ids=(evidence.id,),
@@ -116,7 +116,12 @@ def _candidate(
     )
 
 
-def extract_no_llm(document: SourceDocument, chunks: list[Chunk]) -> list[KnowledgeCandidate]:
+def extract_no_llm(
+    document: SourceDocument,
+    chunks: list[Chunk],
+    *,
+    contract: str | None = None,
+) -> list[KnowledgeCandidate]:
     """Deterministically take the first bounded declarative sentence from each useful chunk."""
     candidates: list[KnowledgeCandidate] = []
     seen: set[str] = set()
@@ -125,54 +130,14 @@ def extract_no_llm(document: SourceDocument, chunks: list[Chunk]) -> list[Knowle
         if len(text) < 20 or _BOILERPLATE.search(text) or re.fullmatch(r"[\W\d_]+", text):
             continue
         sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip()
-        if len(sentence) < 20 or sentence.count(" ") < 2:
+        if len(sentence) < 20 or (is_english(sentence) and sentence.count(" ") < 2):
             continue
-        candidate = _candidate(
-            document, chunk, sentence, provenance=ProvenanceClass.DERIVED_DETERMINISTIC
-        )
-        if candidate.normalized_hash not in seen:
-            candidates.append(candidate)
-            seen.add(candidate.normalized_hash)
-    return candidates
-
-
-def extract_structured(
-    document: SourceDocument,
-    chunks: list[Chunk],
-    provider: StructuredProvider,
-    budget: ExtractionBudget,
-) -> list[KnowledgeCandidate]:
-    context = "\n".join(f"[{chunk.id}] {chunk.text}" for chunk in chunks[:3])
-    budget.consume(context)
-    raw, _, _, _ = provider.generate_structured(
-        "Return JSON claims with statement, chunk_id, topics, why_interesting.\n" + context
-    )
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise KnowledgeError("provider returned invalid JSON") from exc
-    if not isinstance(payload, list):
-        raise KnowledgeError("provider output must be a list")
-    by_id = {chunk.id: chunk for chunk in chunks}
-    candidates: list[KnowledgeCandidate] = []
-    seen: set[str] = set()
-    for item in payload:
-        if (
-            not isinstance(item, dict)
-            or not isinstance(item.get("statement"), str)
-            or item.get("chunk_id") not in by_id
-        ):
-            raise KnowledgeError("provider output has invalid claim or evidence chunk")
-        topics = tuple(
-            topic_slug(str(topic)) for topic in item.get("topics", []) if str(topic).strip()
-        )
-        candidate = _candidate(
+        candidate = make_candidate(
             document,
-            by_id[item["chunk_id"]],
-            item["statement"],
-            provenance=ProvenanceClass.DERIVED_MODEL,
-            topics=topics,
-            why=str(item.get("why_interesting") or "model-selected source-grounded candidate"),
+            chunk,
+            sentence,
+            provenance=ProvenanceClass.DERIVED_DETERMINISTIC,
+            extractor_version=contract,
         )
         if candidate.normalized_hash not in seen:
             candidates.append(candidate)
